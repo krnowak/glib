@@ -47,6 +47,19 @@ struct _GError
   gchar       *message;
 };
 
+/**
+ * GErrorDataCopyFunc:
+ * @data: data to copy
+ *
+ * A function type for copying #GError extra data. It must handle the
+case when @data is %NULL.
+ *
+ * Returns: a copy of @data.
+ *
+ * Since: 2.56
+ */
+typedef gpointer (*GErrorDataCopyFunc) (gpointer data);
+
 GLIB_AVAILABLE_IN_ALL
 GError*  g_error_new           (GQuark         domain,
                                 gint           code,
@@ -72,6 +85,16 @@ GLIB_AVAILABLE_IN_ALL
 gboolean g_error_matches       (const GError  *error,
                                 GQuark         domain,
                                 gint           code);
+GLIB_AVAILABLE_IN_2_56
+void g_error_set_extra_data    (GError              *error,
+                                gpointer             extra_data,
+                                GErrorDataCopyFunc   copy,
+                                GDestroyNotify       notify);
+
+GLIB_AVAILABLE_IN_2_56
+gpointer g_error_get_extra_data  (const GError  *error);
+
+
 
 /* if (err) *err = g_error_new(domain, code, format, ...), also has
  * some sanity checks.
@@ -93,7 +116,7 @@ void     g_set_error_literal   (GError       **err,
  */
 GLIB_AVAILABLE_IN_ALL
 void     g_propagate_error     (GError       **dest,
-				GError        *src);
+                                GError        *src);
 
 /* if (err && *err) { g_error_free(*err); *err = NULL; } */
 GLIB_AVAILABLE_IN_ALL
@@ -111,6 +134,12 @@ void     g_propagate_prefixed_error   (GError       **dest,
                                        GError        *src,
                                        const gchar   *format,
                                        ...) G_GNUC_PRINTF (3, 4);
+
+GLIB_AVAILABLE_IN_2_56
+void g_set_error_extra_data (GError             **error,
+                             gpointer             extra_data,
+                             GErrorDataCopyFunc   copy,
+                             GDestroyNotify       notify);
 
 G_END_DECLS
 

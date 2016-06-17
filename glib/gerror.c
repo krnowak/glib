@@ -367,6 +367,52 @@
  *   to add a check at the top of your function that the error return
  *   location is either %NULL or contains a %NULL error (e.g.
  *   `g_return_if_fail (error == NULL || *error == NULL);`).
+ *
+ * - Since GLib 2.56 #GError can also hold extra data. It is
+ *   recommended that the extra data type is documented and is
+ *   specific to the error domain or code. It is also recommended that
+ *   only the function that actually creates an error (with
+ *   g_set_error() or an other function) may add extra data to
+ *   #GError. The caller of this function should avoid doing it, as it
+ *   would overwrite the extra data set previously and potentially
+ *   confuse the code higher up in the stack. If caller must set some
+ *   extra data, then it is recommended to create an error with a new
+ *   error code and a new extra data type associated to the error
+ *   code. The new extra data type could contain the received error:
+ *
+ *   |[<!-- language="C" -->
+ *   typedef struct ExtraData
+ *   {
+ *     gpointer  stuff;
+ *     GError   *received_error;
+ *   };
+ *
+ *   ExtraData *extra_data_new (gpointer stuff, GError *error);
+ *   gpointer extra_data_copy (gpointer extra_data);
+ *   void extra_data_free (gpointer extra_data);
+ *
+ *   GQuark my_domain_quark ();
+ *   gint my_error_code ();
+ *
+ *   gboolean function_that_can_fail (GError **error);
+ *
+ *   gboolean another_function(GError **error)
+ *   {
+ *     GError *local_error = NULL;
+ *
+ *     if (!function_that_can_fail (&local_error))
+ *       {
+ *         ExtraData extra_data = extra_data_new ("…", local_error);
+ *
+ *         g_set_error (error, my_domain_quark (), my_error_code (), "…");
+ *         g_set_error_extra_data (error, extra_data, extra_data_copy, extra_data_free);
+ *
+ *         return FALSE;
+ *       }
+ *
+ *     return TRUE;
+ *   }
+ *   ]|
  */
 
 #include "config.h"
@@ -376,6 +422,35 @@
 #include "gslice.h"
 #include "gstrfuncs.h"
 #include "gtestutils.h"
+
+typedef struct GRealError GRealError;
+
+struct GRealError
+{
+  GError error;
+  gpointer extra_data;
+  GErrorDataCopyFunc extra_data_copy;
+  GDestroyNotify extra_data_notify;
+};
+
+static GRealError *
+real_error_new_steal_message (GQuark       domain,
+                              gint         code,
+                              gchar       *message)
+{
+  GRealError *real_error;
+
+  real_error = g_slice_new (GRealError);
+
+  real_error->error.domain = domain;
+  real_error->error.code = code;
+  real_error->error.message = message;
+  real_error->extra_data = NULL;
+  real_error->extra_data_copy = NULL;
+  real_error->extra_data_notify = NULL;
+
+  return real_error;
+}
 
 /**
  * g_error_new_valist:
@@ -397,8 +472,8 @@ g_error_new_valist (GQuark       domain,
                     const gchar *format,
                     va_list      args)
 {
-  GError *error;
-
+  GRealError *real_error;
+  gchar *message;
   /* Historically, GError allowed this (although it was never meant to work),
    * and it has significant use in the wild, which g_return_val_if_fail
    * would break. It should maybe g_return_val_if_fail in GLib 4.
@@ -407,13 +482,10 @@ g_error_new_valist (GQuark       domain,
   g_warn_if_fail (domain != 0);
   g_warn_if_fail (format != NULL);
 
-  error = g_slice_new (GError);
+  message = g_strdup_vprintf (format, args);
+  real_error = real_error_new_steal_message (domain, code, message);
 
-  error->domain = domain;
-  error->code = code;
-  error->message = g_strdup_vprintf (format, args);
-
-  return error;
+  return &real_error->error;
 }
 
 /**
@@ -465,18 +537,14 @@ g_error_new_literal (GQuark         domain,
                      gint           code,
                      const gchar   *message)
 {
-  GError* err;
+  GRealError* real_error;
 
   g_return_val_if_fail (message != NULL, NULL);
   g_return_val_if_fail (domain != 0, NULL);
 
-  err = g_slice_new (GError);
+  real_error = real_error_new_steal_message (domain, code, g_strdup (message));
 
-  err->domain = domain;
-  err->code = code;
-  err->message = g_strdup (message);
-
-  return err;
+  return &real_error->error;
 }
 
 /**
@@ -488,11 +556,16 @@ g_error_new_literal (GQuark         domain,
 void
 g_error_free (GError *error)
 {
+  GRealError *real_error;
+
   g_return_if_fail (error != NULL);
 
+  real_error = (GRealError *)error;
   g_free (error->message);
+  if (real_error->extra_data_notify)
+    real_error->extra_data_notify (real_error->extra_data);
 
-  g_slice_free (GError, error);
+  g_slice_free (GRealError, real_error);
 }
 
 /**
@@ -506,20 +579,26 @@ g_error_free (GError *error)
 GError*
 g_error_copy (const GError *error)
 {
-  GError *copy;
- 
+  const GRealError *real_error;
+  GRealError *copy;
+
   g_return_val_if_fail (error != NULL, NULL);
   /* See g_error_new_valist for why these don't return */
   g_warn_if_fail (error->domain != 0);
   g_warn_if_fail (error->message != NULL);
 
-  copy = g_slice_new (GError);
+  real_error = (const GRealError *)error;
+  copy = real_error_new_steal_message (error->domain,
+                                       error->code,
+                                       g_strdup (error->message));
 
-  *copy = *error;
+  copy->extra_data = real_error->extra_data;
+  copy->extra_data_copy = real_error->extra_data_copy;
+  copy->extra_data_notify = real_error->extra_data_notify;
+  if (real_error->extra_data_copy)
+    copy->extra_data = real_error->extra_data_copy (real_error->extra_data);
 
-  copy->message = g_strdup (error->message);
-
-  return copy;
+  return &copy->error;
 }
 
 /**
@@ -549,6 +628,62 @@ g_error_matches (const GError *error,
   return error &&
     error->domain == domain &&
     error->code == code;
+}
+
+/**
+ * g_error_set_extra_data:
+ * @error: a #GError
+ * @extra_data: data to add
+ * @copy: function for copying @extra_data
+ * @notify: function for destroying @extra_data
+ *
+ * Sets extra data in @error. When @error is copied with
+ * g_error_copy() extra data will be also copied if @copy is not
+ * %NULL; otherwise it will be just a shallow copy. When @error is
+ * destroyed with g_error_free(), extra data will be freed with
+ * @notify, if @notify is not %NULL.
+ *
+ * Please note, that @extra_data is not checked for %NULL to omit
+ * copying or destructing.
+ *
+ * Since: 2.56
+ */
+void
+g_error_set_extra_data (GError              *error,
+                        gpointer             extra_data,
+                        GErrorDataCopyFunc   copy,
+                        GDestroyNotify       notify)
+{
+  GRealError *real_error;
+
+  g_return_if_fail (error != NULL);
+  g_return_if_fail ((copy == NULL && notify == NULL) || (copy != NULL && notify != NULL));
+
+  real_error = (GRealError *)error;
+  if (real_error->extra_data_notify)
+    real_error->extra_data_notify (real_error->extra_data);
+  real_error->extra_data = extra_data;
+  real_error->extra_data_copy = copy;
+  real_error->extra_data_notify = notify;
+}
+
+/**
+ * g_error_get_extra_data:
+ * @error: a #GError
+ *
+ * Returns: (transfer none): an extra data
+ *
+ * Since: 2.56
+ */
+gpointer
+g_error_get_extra_data (const GError *error)
+{
+  const GRealError *real_error;
+
+  g_return_val_if_fail (error != NULL, NULL);
+
+  real_error = (const GRealError *)error;
+  return real_error->extra_data;
 }
 
 #define ERROR_OVERWRITTEN_WARNING "GError set over the top of a previous GError or uninitialized memory.\n" \
@@ -754,4 +889,39 @@ g_propagate_prefixed_error (GError      **dest,
       g_error_add_prefix (&(*dest)->message, format, ap);
       va_end (ap);
     }
+}
+
+/**
+ * g_set_error_extra_data:
+ * @error: a #GError return location
+ * @extra_data: data to add
+ * @copy: function for copying @extra_data
+ * @notify: function for destroying @extra_data
+ *
+ * Does nothing if @error is %NULL; if @error is non-%NULL, then
+ * *@error also must not be %NULL.
+ *
+ * Sets an extra data in @error. When @error is copied with
+ * g_error_copy() extra data will be also copied if @copy is not
+ * %NULL; otherwise it will be just a shallow copy. When @error is
+ * destroyed with g_error_free(), extra data will be freed with
+ * @notify, if @notify is not %NULL.
+ *
+ * Please note, that @extra_data is not checked for %NULL to omit
+ * copying or destructing.
+ *
+ * Since: 2.56
+ */
+void
+g_set_error_extra_data (GError             **error,
+                        gpointer             extra_data,
+                        GErrorDataCopyFunc   copy,
+                        GDestroyNotify       notify)
+{
+  if (error == NULL)
+    return;
+
+  g_return_if_fail (*error != NULL);
+
+  g_error_set_extra_data (*error, extra_data, copy, notify);
 }
